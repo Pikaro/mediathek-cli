@@ -1,0 +1,1362 @@
+#!/usr/bin/python
+
+# TODO: Graphical config dialog
+# TODO: Config backup
+# TODO: Check how we're run - seems to be impossible
+#	(cron / scheduler / terminal / xterm / gui)
+# TODO: What is this bug?
+FILTER_BUG = True
+
+# Set this to desired value to change from default configuration directory!
+CONFDIR = None
+
+# Default values for config file
+# ALL of these keys must be present in the file!
+# Only keys on second level allowed to edit, first contains categories!
+# Only str values - don't edit if you don't know what that is!
+defaults = {
+	'downloads':{
+		# Server to use for lists
+		'server':'http://d-reis.com/filmeliste.xz',
+		# Desired kbps
+		'ratelimit':'512',
+		# Hard: up to ratelimit, soft: want ratelimit as avg
+		# TODO
+		'limit':'soft',
+		# Timeout for one chunk of data to arrive
+		'timeout':'60',
+		# Maximum number of timeouts
+		'timeout_retries':'3',
+		# Bytes to download at once
+		'chunksize':'32768',
+		# Continue after timeouts - may cause corruption
+		# TODO
+		'continue_downloads':'True',
+		# Target for broadcast downloads
+		'targetdir':'~'
+	},
+	
+	'ui':{
+		# Icon for notifications
+		'notifyicon':'minitube'},
+
+	'debug':{
+		# Debug output
+		'debug':'False',
+		# Timing output
+		'timing':'False',
+		# Be quiet even when run manually, not advised
+		'quietconsole':'False'}
+}
+
+##############################
+### IMPORTS
+##############################
+
+# OS-related
+from os.path import exists, getsize
+from os import makedirs, remove, system, rename
+from contextlib import closing
+from shutil import copyfile, rmtree
+import sys, os, platform
+
+# UI-related
+try:
+	from gi.repository import Gtk, Gdk
+	UI = True
+except ImportError:
+	log.warn("Unable to find GTK and / or Gdk! GUI will not be usable.")
+	UI = False
+if not os.getenv('DISPLAY'):
+	log.warn("Unable to find a display! GUI will not be usable.")
+	UI = False
+import signal
+
+# Web-related
+from urlparse import urlparse
+import urllib
+import socket
+
+# Date-related
+from time import strptime, sleep, time
+import datetime
+
+# Environment-related
+from ConfigParser import SafeConfigParser
+import logging as log
+import argparse 
+
+# Helpers
+from hashlib import md5
+from math import pow,sqrt
+from lzma import decompress
+
+##############################
+### OS-SPECIFIC PARTS
+##############################
+
+OS = platform.system()
+
+# Notifications - see if we're able to get them
+# TODO: Windows / Mac notifications
+if OS == 'Linux':
+	try:
+		import dbus
+		NOTIFY = True
+	except ImportError:
+		log.warn("No DBus module found! Notifications will be disabled.")
+		NOTIFY = False
+	if NOTIFY:
+		try:
+			dbus.SessionBus.get_object(dbus.SessionBus(),'org.freedesktop.Notifications','/org/freedesktop/notifications')
+			NOTIFY = True
+		except dbus.exceptions.DBusException:
+			log.warn("No notification server found on DBus! Notifications will be disabled.")
+			NOTIFY = False
+	def notification(title,body,icon=None):
+		'''Display notifications'''
+		notify_bus = 'org.freedesktop.Notifications'
+		notify_obj = '/org/freedesktop/Notifications'
+		session_bus = dbus.SessionBus()
+	  
+		notify_obj = session_bus.get_object(notify_bus, notify_obj)
+		interface = dbus.Interface(notify_obj, notify_bus)
+		interface.Notify('mediathek-cli', 0, icon, title, body, [], [], 5000)
+elif OS == 'Windows':
+	NOTIFY = False
+elif OS == 'Darwin':
+	NOTIFY = False
+else:
+	log.warn("OS == "+OS+". Sorry, no notifications.")
+	NOTIFY = False
+
+# Make sure notify is defined
+try:
+	notify
+except NameError:
+	NOTIFY = False
+
+# Empty notification method :(
+if not NOTIFY:
+	def notification(title,body,icon=None):
+		pass
+
+
+# Set default configuration directory and files
+# TODO: Separate CONFDIR and CACHEDIR
+if CONFDIR:
+	pass
+elif OS == 'Linux':
+	CONFDIR = os.path.expanduser(os.path.join('~','.config','mediathek-cli'))
+elif OS == 'Windows':
+	CONFDIR = os.path.expanduser(os.path.join(os.getenv('APPDATA'),'mediathek-cli'))
+elif OS == 'Darwin':
+	CONFDIR = os.path.expanduser(os.path.join('~','Library','Application Support','mediathek-cli'))
+else:
+	CONFDIR = os.path.expanduser(os.path.join('~','.mediathek-cli'))
+	log.warn("OS == "+OS+" - guessing *NIX? Using "+CONFDIR+" as configuration directory.")
+
+CONFFILE = os.path.join(CONFDIR,'rcfile')
+CONFFILES = ['seen','blacklist','subscribe','stations']
+
+# Global options variable
+# TODO: Bad practice? Possible w/o OO?
+opts = {}
+
+# Separator character for all data - DO NOT CHANGE THIS!
+SEPCHAR = ';;'
+
+##############################
+### CHECK FOR OTHER INSTANCE
+##############################
+
+locksock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+try:
+	locksock.bind('\0mediathek-cli')
+except:
+	log.warn("Another instance of mediathek-cli is already running!")
+	exit(1)
+
+###################################################################################################################################################################
+
+##############################
+### HELPER FUNCTIONS
+##############################
+
+def conffile(name):
+	'''Return the path to a configuration file'''
+	if name not in CONFFILES:
+		log.error("Unknown configuration file requested: "+name)
+		exit(1)
+	return os.path.expanduser(os.path.join(CONFDIR,name))
+
+def listfile(name):	
+	'''Return the path to a file containing show definitions'''
+	return os.path.expanduser(os.path.join(CONFDIR,'lists',name))
+
+def serverfile(name):
+	'''Return the path of a file on the list server'''
+	return opts['server']+'/'+name
+
+def ask(what,default=True):
+	'''Simple yes / no prompt for the shell'''
+	false = ['n','no','nein']
+	true = ['y','yes','j','ja']
+	
+	if default:
+		prompt=what+' [Y/n]: '
+	else:
+		prompt=what+' [y/N]: '
+	
+	while true:
+		print prompt
+		response = raw_input().lower()
+		if response == '':
+			return default
+		if response in true:
+			return True
+		if response in false:
+			return False
+
+class partialURLOpener(urllib.FancyURLopener):
+	'''Ignore HTTP error 206 with this opener ('sending incomplete file')'''
+	def http_error_206(self, url, fp, errcode, errmsg, headers, data=None):
+		pass
+
+def broadcast_hash(broadcast):
+	'''Generate a hash value that uniquely identifies each broadcast. Still looking for a way to identify repeats...
+		broadcast['Titel'] tends not to change throughout series sometimes, so not an option.'''
+	hashval = md5((broadcast['Titel'] + broadcast['Datum'] + broadcast['Zeit']).decode('UTF-8').encode('UTF-8')).hexdigest()
+	return hashval
+
+def unxz(name, keep=False):
+	'''Decompress LZMA archive in-place, or keep archive if keep is True'''
+	with closing(open(name)) as compressed_f:
+		with closing(open(name.replace('.xz',''),'w')) as uncompressed_f:
+			uncompressed_f.write(decompress(compressed_f.read()))
+	if not keep:
+		remove(name)
+
+def average_duration(count,sum_seconds,weighted=False):
+	'''Calculate the average duration of a show to get sane values for the GUI'''
+	if not count or not sum_seconds:
+		return 0
+	dur = float(sum_seconds / count)	# Standard average
+	if weighted: dur = sqrt(dur)			# We squared before to favor longer shows
+	dur = dur / 60										# To minutes
+	dur = round(dur/5)*5							# Round to nearest 5
+	return int(dur)
+
+def http_last_modified(what):
+	with closing(urllib.urlopen(what)) as c:
+		last_modified = c.info().getdate('last-modified')
+	return datetime.datetime(*last_modified[:6])
+
+##############################
+### DOWNLOAD FUNCTIONS
+##############################
+
+#open_retry
+def open_retry(what, where, tries):
+	'''Try <tries> times * timeout to open a URL for downloading it with read(), abort program otherwise'''
+	chunksize = opts['chunksize']
+
+	opener = partialURLOpener()
+	# Determines the proper place to start at by checking target file
+	# Just hope the server supports the Range header
+	if exists(where) and not getsize(where) < chunksize:
+		existing_size = getsize(where)
+		target = open(where,'ab')
+		opener.addheader('Range','bytes='+str(existing_size)+'-')
+		log.info("Resuming partial download at offset +"+str(int(existing_size/1024))+" Bytes.")
+	else:
+		existing_size = 0
+		target = open(where,'wb')
+
+	# Timeout catching, pretty simple, repeat <tries> times
+	for i in range(tries):
+		try:
+			source = opener.open(what)
+			failed = False
+		except IOError:
+			failed = True
+			log.warn("Timed out trying to open "+what+"!")
+
+	if failed:
+		log.error("Timed out three times. Check your Internet connection!")
+		exit(1)
+
+	# Successfully opened URL
+	return target, opener, source, existing_size
+#/open_retry
+
+#download
+def download(what,where,quiet=True,show=False):
+	'''Download what to where - quiet suppresses messages, show turns on 'Abort with Ctrl+C'
+		
+		This function combines:
+			* Timeout catching, reopen connection to server on shaky WiFi or so
+			* Manual aborts, hackily implemented by KeyInterrupt
+			* Progress monitoring by reading <chunksize> bytes at a time and printing it to CLI'''
+
+	if opts['quiet'] or opts['quietconsole'] or quiet:
+		quiet = True
+	else:
+		quiet = False
+
+	# Handlers and info for local file and URL
+	target, opener, source, existing_size = open_retry(what, where, opts['timeout_retries'])
+	chunksize = opts['chunksize']
+	
+	starttime = time()
+	limit = opts['ratelimit']
+	try:
+		totalsize = float(source.headers['Content-Length'])
+		size_known = True
+	except KeyError:
+		size_known = False
+	
+	# Only download if we know the size and we already got that much
+	if not size_known or not int(totalsize) == existing_size:
+
+		if not quiet:
+			# Control characters turn off cursor in shell
+			print '\033[?25l\r',
+			if show:
+				log.info("Press Ctrl+C to skip download. Then mark it seen with the -m switch if desired.")
+		
+		downloaded = 0
+		# try clause for manually aborting download
+		try:
+			while True:
+				# Retry three times at most
+				for i in range(opts['timeout_retries']):
+					# Try reading each chunk, close and reopen connection after failure, then try again
+					try:
+						chunk = source.read(chunksize)
+						failed = False
+						break
+					except Exception, e:
+						if type(e) == socket.timeout:
+							if not quiet:
+								print ''
+							log.error("Timed out while trying to read "+what+"!")
+							failed = True
+							opener.close()
+							target.close()
+							target, opener, source, existing_size = open_retry(what, where, opts['timeout_retries']-i)
+						else:
+							raise
+							exit(1)
+				if failed:
+					log.error("Timed out three times! Check your Internet connection.")
+					notification("Error while downloading from Mediathek','Timed out three times while downloading",'error')
+					exit(1)
+				
+				# Done reading
+				if not chunk:
+					break
+				
+				# Append chunk to file
+				target.write(chunk)
+
+				# Show a status line to the user
+				downloaded += float(len(chunk) / 1024)
+				expected_time = downloaded / limit
+				passed_time = time() - starttime
+				sleep_time = expected_time - passed_time
+				rate = downloaded / passed_time
+
+				if size_known:
+					remaining = (totalsize / 1024) - downloaded
+					if rate:
+						remaining_time = remaining / rate
+					else:
+						remaining_time = 0
+
+				if not quiet:
+					if size_known:
+						print "{0:.2f} MByte of {1:.2f} MByte downloaded with avg {2:.0f}kBps (target: {3:.0f}kBps), {4:.0f}s passed - ETA: t+{5:.0f}s          \r".format(
+							float(downloaded/1024),float(totalsize / (1024*1024)),rate,limit,passed_time,remaining_time),
+					else:
+						print "{0:.2f} MByte of ? MByte downloaded with avg {1:.0f}kBps (target: {2:.0f}kBps), {3:.0f}s passed - ETA: t+?s          \r".format(
+							float(downloaded/1024),rate,limit,passed_time),
+
+				if sleep_time > 0 and rate > 0 and remaining_time > 0:
+					sleep(sleep_time)
+			
+			# Successfully downloaded file	
+			retval = True
+
+		except KeyboardInterrupt:
+			retval = False
+		
+		if not quiet:
+			# Turn cursor back on
+			print '\033[?25h'
+
+			if retval:
+				log.info("Complete.")
+			else:
+				log.info("Canceled.")		
+	
+	else:
+		log.warn("File has been downloaded completely before.")
+		retval = True
+
+	source.close()
+	target.close()
+
+	# Return True if the user did not interrupt	
+	return retval
+#/download
+
+###################################################################################################################################################################
+
+##############################
+### UI CLASSES
+##############################
+
+#####################
+#comboEntryFilterList
+class comboEntryFilterList:
+	'''Defines the two panes for subscribed and unsubscribed shows that make up the main window'''
+
+	def __init__(self, list, stations, titles, action):
+		'''Initialize an object describing a pane'''
+
+		self.list = list
+		self.stations = stations
+
+		self.button_title = titles['button']
+		self.window_title = titles['window']
+
+		self.action = action
+
+		# Get a color that is slightly darker than the background for contrast
+		# TODO: Find a better way to do this
+		temp = Gtk.Window()
+		default_bg = temp.get_style_context().get_background_color(Gtk.StateFlags.NORMAL)
+		dark_bg = default_bg.copy()
+		if dark_bg.red >= 0.1:
+			dark_bg.red -= 0.1
+		if dark_bg.blue >= 0.1:
+			dark_bg.blue -= 0.1
+		if dark_bg.green >= 0.1:
+			dark_bg.green -= 0.1
+		self.dark_bg = dark_bg.to_color()
+		self.default_bg = default_bg.to_color()
+
+		# store contains the show list, filter it by station and strings contained
+		store = Gtk.ListStore(str,str,int,int)
+		store_filter = store.filter_new()
+		for show in self.list:
+			store.append([show[1]['where'].decode('UTF-8').encode('UTF-8'),show[0].decode('UTF-8').encode('UTF-8'),show[1]['dur'],show[1]['count']])
+		store_filter.set_visible_func(self.row_visible)
+
+		# tree is the widget that contains store
+		tree = Gtk.TreeView()
+		tree.connect('cursor-changed', self.list_selection, tree.get_selection().get_selected)
+		tree.columns = [None]*4
+		tree.columns[0] = Gtk.TreeViewColumn('Sender')
+		tree.columns[1] = Gtk.TreeViewColumn('Sendung')
+		tree.columns[2] = Gtk.TreeViewColumn('Dauer')
+		tree.columns[3] = Gtk.TreeViewColumn('Zahl')
+
+		tree.set_model(store_filter)
+		self.visible_rows = len(self.list)
+
+		for n in range(4):
+			tree.append_column(tree.columns[n])
+			tree.columns[n].cell = Gtk.CellRendererText()
+			tree.columns[n].pack_start(tree.columns[n].cell, True)
+			tree.columns[n].set_attributes(tree.columns[n].cell, text=n)
+			tree.columns[n].set_resizable(True)
+		tree.columns[1].set_expand(True)
+		tree.set_search_column(1)
+
+		# ComboBox that allows to filter for a station
+		active_station = self.stations[0]
+		stations_combo = Gtk.ComboBoxText()
+		for station in stations:
+			stations_combo.append_text(station)
+		stations_combo.set_active(0)
+		stations_combo.connect('changed', self.refresh)
+		
+		# Filter Entry that allows to search for text
+		show_entry = Gtk.Entry()
+		show_entry.connect('changed', self.refresh)
+		show_entry.set_icon_from_icon_name(0,'find')
+
+		##### BEGIN PACKING
+		
+		# vbox contains the whole pane
+		vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+		# hbox contains the filters
+		hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+		hbox.pack_start(stations_combo, expand=False, fill=False, padding=0)
+		hbox.pack_start(show_entry, expand=True, fill=True, padding=0)
+		vbox.pack_start(hbox, expand=False, fill=True, padding=0)
+
+		# statusframe contains a line describing the current filter
+		statusframe = Gtk.Frame()
+		statusbox = Gtk.HBox()
+		num_label = Gtk.Label()
+		num_label.set_alignment(0,0)
+		num_label.set_text(str(self.visible_rows))
+		statusbox.pack_start(num_label, expand=True, fill=True, padding=5)
+		help_label = Gtk.Label()
+		help_label.set_alignment(1,0)
+		help_label.set_text("...shows on all channels")
+		statusbox.pack_start(help_label, expand=True, fill=True, padding=5)
+		statusbox.set_border_width(2)
+		statusframe.add(statusbox)
+		vbox.pack_start(statusframe, expand=False, fill=True, padding=0)
+
+		# scrolled contains the show list
+		scrolled = Gtk.ScrolledWindow()
+		scrolled.add(tree)
+		scrolled_frame = Gtk.Frame()
+		scrolled_frame.add(scrolled)
+		vbox.pack_start(scrolled_frame, expand=True, fill=True, padding=0)
+
+		# doframe contains the elements needed to subscribe / unsubscribe
+		doframe = Gtk.Frame()
+		doframe.set_shadow_type(Gtk.ShadowType.IN)
+		dobox = Gtk.HBox(spacing=3)
+		do_station = Gtk.Label()
+		do_station_event = Gtk.EventBox()
+		do_station_event.add(do_station)
+		do_station_event.modify_bg(Gtk.StateFlags.NORMAL,self.default_bg)
+		do_station_frame = Gtk.Frame()
+		do_station_frame.add(do_station_event)
+		do_station.set_size_request(150,-1)
+		do_station.set_alignment(0,0.5)
+		do_station.set_margin_left(5)
+		dobox.pack_start(do_station_frame, expand=False, fill=False, padding=0)
+		do_title = Gtk.Label()
+		do_title.set_alignment(0,0.5)
+		do_title.set_margin_left(5)
+		do_title_event = Gtk.EventBox()
+		do_title_event.add(do_title)
+		do_title_event.modify_bg(Gtk.StateFlags.NORMAL,self.default_bg)
+		do_title_frame = Gtk.Frame()
+		do_title_frame.add(do_title_event)
+		dobox.pack_start(do_title_frame, expand=True, fill=True, padding=0)
+		do_time = Gtk.Entry()
+		do_time.set_width_chars(0)
+		do_time.set_size_request(100,-1)
+		do_time.set_alignment(0)
+		dobox.pack_start(do_time, expand=False, fill=False, padding=0)
+		do_min = Gtk.Label("min.")
+		dobox.pack_start(do_min, expand=False, fill=False, padding=0)
+		do_do = Gtk.Button(self.button_title)
+		do_do.connect('button-press-event',self.action,self.get_list_selection)
+		do_do.set_size_request(100,-1)
+		dobox.pack_start(do_do, expand=False, fill=True, padding=0)
+		dobox.set_border_width(1)
+		doevent = Gtk.EventBox()
+		doevent.add(dobox)
+		doevent.modify_bg(Gtk.StateFlags.NORMAL,self.dark_bg)
+		doframe.add(doevent)
+		vbox.pack_start(doframe, expand=False, fill=True, padding=0)
+		
+		# header sits atop the pane
+		header_text = Gtk.Label()
+		header_text.set_text(self.window_title)
+		header = Gtk.Frame()
+		header.add(header_text)
+
+		# main_box combines header and vbox
+		main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=4)
+		main_box.pack_start(header, expand=False, fill=False, padding=0)
+		main_box.pack_start(vbox, expand=True, fill=True, padding=0)
+
+		# Various handles to make element use from other functions easier to read
+		self.get_list_entries = tree.get_model().iter_n_children
+		self.get_active_station = stations_combo.get_active_text
+		self.get_active_filter = show_entry.get_text
+		self.update_count = num_label.set_text
+		self.update_help = help_label.set_text
+		self.update_do_station = do_station.set_text
+		self.check_do_station = do_station.get_text
+		self.update_do_show = do_title.set_text
+		self.check_do_show = do_title.get_text
+		self.update_do_time = do_time.set_text
+		self.check_do_time = do_time.get_text
+		self.refresh_list = store_filter.refilter
+		self.tree_store = store
+		self.public_box = main_box
+	#/init
+
+	def update(self, showlist):
+		'''Build a new show list according to showlist'''
+		self.tree_store.clear()
+		for show in showlist:
+			self.tree_store.append([show[1]['where'].decode('UTF-8').encode('UTF-8'),show[0].decode('UTF-8').encode('UTF-8'),show[1]['dur'],show[1]['count']])
+		self.refresh()
+
+	def refresh(self, event=None):
+		'''Refresh the show list after a filter has been applied and update the filter description status accordingly'''
+		# Have to compensate for filter calling row_visible twice for previously hidden rows - why?
+		if FILTER_BUG:
+			visible_rows_before = self.visible_rows
+
+		self.visible_rows = 0
+		# Actually refresh the list here, iterates visible_rows
+		self.refresh_list()
+
+		if FILTER_BUG:
+			delta = round(float( ( self.visible_rows - visible_rows_before )) / 2 )
+			if delta > 0:
+				self.visible_rows -= delta
+
+		self.visible_rows = int(self.visible_rows)
+		# Update show count in status_frame
+		self.update_count(str(self.visible_rows))
+
+		station = self.get_active_station()
+		text_filter = self.get_active_filter()
+		if self.visible_rows == 1:
+			plural = ''
+		else:
+			plural = 's'
+		
+		# Update filter description in status_frame
+		if station == 'All' and not text_filter:
+			helpstring = "...show"+plural+" on all channels"
+		elif station =='All':
+			helpstring = "...show"+plural+" containing '"+text_filter.lower()+"' on all channels"
+		elif not text_filter:
+			helpstring = "...show"+plural+" on channel "+station
+		else:
+			helpstring = "...show"+plural+" containing '"+text_filter.lower()+"' on channel "+station
+		self.update_help(helpstring)
+	#/refresh
+
+	def row_visible(self, model, iter, data):
+		'''Callback to determine if a row is visible'''
+		sub_station = self.get_active_station()
+		text_filter = self.get_active_filter()
+		if (
+			sub_station == 'All' or sub_station == model.get_value(iter,0) # Filtered out by station?
+		) and (
+			text_filter == '' or text_filter.lower() in model.get_value(iter, 1).lower() # Filtered out by text?
+		):
+			self.visible_rows += 1
+			return True
+		else:
+			return False
+			
+	def list_selection(self, event, selection_method):
+		'''Callback if the user clicks a show list entry'''
+		model = selection_method()[0]
+		model_iter = selection_method()[1]
+		if model_iter:
+			station = model.get_value(model_iter,0)
+			show = model.get_value(model_iter,1)
+			duration = model.get_value(model_iter,2)
+			
+			self.update_do_station(station)
+			self.update_do_show(show)
+			self.update_do_time(str(duration))
+
+	def get_list_selection(self):
+		'''Returns the currently selected show'''
+		return (self.check_do_station(),self.check_do_show(),self.check_do_time())
+
+	def get_box(self):
+		'''Returns the box containing the whole pane'''
+		return self.public_box
+#/comboEntryFilterList
+######################
+
+######################
+#DialogWindow
+class DialogWindow(Gtk.Window):
+	'''Window definition containing two show list panes, handles subscribe and unsubscribe events'''
+
+	def __init__(self, subscribed, unsubscribed, stations):
+		'''Initialize the window'''
+		
+		self.subscribed = subscribed
+		self.unsubscribed = unsubscribed
+		self.stations = stations
+
+		Gtk.Window.__init__(self, title="Mediathek-Themen")
+		self.set_border_width(4)
+		self.set_size_request(1600,800) # TODO: Dynamic sizing?
+
+		# Create the objects that contain the panes
+		sub_box = comboEntryFilterList(self.subscribed, self.stations, {'window':"Subscribed Shows", 'button':"Unsubscribe"},self.unsubscribe)
+		unsub_box = comboEntryFilterList(self.unsubscribed, self.stations, {'window':"Not Subscribed To", 'button':"Subscribe"},self.subscribe)
+		
+		# Display panes in a HPaned widget
+		pane = Gtk.HPaned()
+		pane.add1(sub_box.get_box())
+		pane.add2(unsub_box.get_box())
+
+		self.add(pane)
+		
+		self.show_all()
+		
+		# Handle bar at 50%
+		pane.set_position(pane.get_allocation().width/2)
+		
+		self.sub = sub_box
+		self.unsub = unsub_box
+	#/init
+
+	#subscribe
+	def subscribe(self, widget, event, get_select):
+		'''Subscribe to a show, callback for the respective button being clicked'''
+		sep = SEPCHAR
+		
+		# Make sure our show titles don't contain sep so it doesn't break the CSV
+		station = get_select()[0].replace(sep,' ')
+		show = get_select()[1].replace(sep,' ')
+		time = get_select()[2]
+		
+		# Only accept complete entries
+		if not (station and show and time):
+			return False
+		
+		try:
+			time = str(time)
+		except:
+			return False
+		
+		# Write subscription to file
+		string = station+sep+show+sep+time+'\n'
+		with closing(open(conffile('subscribe'),'a')) as f:
+			f.write(string)
+		
+		# Update objects in memory to transfer the show to the other pane, then update the view
+		for i in range(len(self.unsubscribed)):
+			if self.unsubscribed[i][0] == show and self.unsubscribed[i][1]['where'] == station:
+				self.subscribed.append(self.unsubscribed.pop(i))
+				self.subscribed = sorted(self.subscribed, key=lambda s: s[0].lower())
+				self.unsubscribed = sorted(self.unsubscribed, key=lambda s: s[0].lower())
+				self.sub.update(self.subscribed)
+				self.unsub.update(self.unsubscribed)
+				break
+	#/subscribe
+	
+	#unsubscribe
+	def unsubscribe(self, widget, event, get_select):
+		'''Unsubscribe from a show, callback for the respective button being clicked'''
+		sep = SEPCHAR
+		
+		# Make sure our show titles don't contain sep so it doesn't break the CSV
+		station = get_select()[0].replace(sep,' ')
+		show = get_select()[1].replace(sep,' ')
+		time = get_select()[2]
+		
+		# Only accept complete entries
+		if not (station and show and time):
+			return False
+		
+		try:
+			time = str(time)
+		except:
+			return False
+		
+		# Read subscriptions, remove unsubscribed show, write them again
+		with closing(open(SUBSCRIPTIONS)) as f:
+			subs = f.read().splitlines()
+		for line in range(len(subs)):
+			line_list = subs[line].split(sep)
+			if line_list[0] == station and line_list[1] == show:
+				break
+		subs.pop(line)
+		subs = '\n'.join(subs)
+		with closing(open(conffile('subscribe'),'w')) as f:
+			f.write(subs+'\n')
+		
+		# Update objects in memory to transfer the show to the other pane, then update the view
+		for i in range(len(self.subscribed)):
+			if self.subscribed[i][0] == show and self.subscribed[i][1]['where'] == station:
+				self.unsubscribed.append(self.subscribed.pop(i))
+				self.unsubscribed = sorted(self.unsubscribed, key=lambda s: s[0].lower())
+				self.subscribed = sorted(self.subscribed, key=lambda s: s[0].lower())
+				self.sub.update(self.subscribed)
+				self.unsub.update(self.unsubscribed)
+				break
+	#/unsubscribe
+#/DialogWindow
+######################
+
+###################################################################################################################################################################
+
+##############################
+### SEQUENTIAL SCRIPT PART
+##############################
+
+###
+### CONFIGURATION STAGE
+###
+
+#parse_config
+def check_config():
+	'''Check / create all necessary files'''
+
+	# Make sure configuration directory is present, create it if not
+	if not exists(CONFDIR):
+		log.error("Missing configuration directory.")
+		if ask("Should I create "+CONFDIR+"?"):
+			makedirs(CONFDIR)
+		else:
+			log.error("You may edit the path of the configuration directory in mediathek-cli itself, at the very top of the document.")
+			exit(1)
+
+	# Make sure configuration file is present, create it if not
+	if not exists(CONFFILE):
+		log.error("Missing configuration file. Creating a default one at "+CONFFILE+".")
+		what = ''
+		for key in defaults:
+			what += '['+key+']\n'
+			for entry in defaults[key]:
+				what += entry + ' = ' + defaults[key][entry] + '\n'
+		with closing(open(CONFFILE,'w')) as f:
+			f.write(what)
+
+	# Make sure list directory is present, create it if not
+	listdir = os.path.join(CONFDIR,'lists')
+	if not exists(listdir):
+				makedirs(listdir)
+
+	# Make sure all configuration files are present, create them if not
+	for name in CONFFILES:
+		if not exists(conffile(name)):
+			file(conffile(name),'w').close()
+
+	# Temporary parser here
+	conf = SafeConfigParser()
+	conf.read(CONFFILE)
+
+	# Check if all keys are present
+	for key in defaults:
+		if not conf.has_section(key):
+			log.error("Malformed config file - missing ["+key+"]")
+			exit(1)
+		for entry in defaults[key]:
+			if not conf.has_option(key,entry):
+				log.error("Malformed config file - missing ["+key+"] "+entry)
+				exit(1)
+#/parse_config
+
+#parse_arguments()
+def parse_arguments():
+	'''Pretty self-explanatory. Parse command-line arguments into opts[] and add conffile values.'''
+	global opts
+	
+	infostring="Multiple arguments of -[sudg] can be passed.\nThey do not conflict and execute in the order listed here."
+
+	p = argparse.ArgumentParser(description="Update, download or select subscriptions from Mediathek\n\n"+infostring, formatter_class=argparse.RawTextHelpFormatter, add_help=False)
+
+	p.add_argument('-s','--show-update',help="update show list (default)",required=False,action='store_true')
+	p.add_argument('-u','--update',help="update broadcast list",required=False,action='store_true')
+	p.add_argument('-d','--download',help="download unseen shows from Mediathek",required=False,action='store_true')
+	p.add_argument('-g','--gui',help="open selection GUI\n\n",required=False,action='store_true')
+
+	p.add_argument('-c','--clear',help="clear local show lists - use sparingly, only if yours are corrupted!", required=False,action='store_true')
+	p.add_argument('-m','--mark-seen',help="mark all as seen, or [show] if present", required=False,default=False,const=True,nargs='?',metavar='show')
+
+	p.add_argument('-t','--test',help="dummy run - skip download and mark actions",required=False,action='store_true')
+	p.add_argument('-q','--quiet',help="only output errors to the console - use with cron!",required=False,action='store_true')
+	p.add_argument('-h','--help',help="show this help message and exit",required=False,action='store_true')
+
+	# Parse command line options
+	opts = vars(p.parse_args())
+	
+	# Add config file options to opts for easy access
+	# Automatically convert conffile options to int / bool
+	conf = SafeConfigParser()
+	conf.read(CONFFILE)
+
+	for section in conf.sections():
+		for option in conf.options(section):
+			if opts.has_key(option):
+				log.error("Programming error - conflicting option values for "+option+"!")
+				exit(1)
+			
+			value = conf.get(section,option)
+
+			try:
+				opts[option] = int(value)
+				continue
+			except ValueError:
+				pass
+				
+			if value == 'True':
+				opts[option] = True
+				continue
+			if value == 'False':
+				opts[option] = False
+				continue
+				
+			opts[option] = value
+
+	# Implemented manually to format the list better
+	if opts['help']:
+		p.print_help()
+		exit(0)
+
+	if opts['clear']:
+		log.warn("Erasing show list and all station lists.")
+		listdir = os.path.expanduser(os.path.join(CONFDIR,'lists'))
+		rmtree(listdir)
+		makedirs(listdir)
+		exit(0)
+	
+	if opts['gui'] and not UI:
+		log.error("Asked for GUI, but no display server is available.")
+		exit(1)
+#/parse_arguments
+
+def apply_options():
+	global log, opts
+	# Suppress all warnings and infos if so desired, especially for cron
+	if opts['quiet']:
+		log.basicConfig(level=log.ERROR)
+	elif opts['quietconsole']:
+		log.basicConfig(level=log.WARN)
+	elif opts['debug']:
+		log.basicConfig(level=log.DEBUG)
+	else:
+		log.basicConfig(level=log.INFO)
+
+	if opts['test']:
+		log.warn("DUMMY RUN. No actual downloads will take place, no shows will be marked as seen.")
+
+	if opts['mark_seen'] == True:
+		log.warn("CLEANING RUN. All shows will be marked as seen.")
+	elif opts['mark_seen']:
+		log.warn("CLEANING RUN. All broadcast of '"+opts['mark_seen']+"' will be marked as seen.")
+
+	if not Gtk.IconTheme.has_icon(Gtk.IconTheme.get_default(),opts['notifyicon']):
+		log.error("Current icon theme does NOT have the icon you specified! ("+opts['notifyicon']+")")
+		opts['notifyicon'] = 'error'
+
+	socket.setdefaulttimeout(opts['timeout'])
+#/apply_options
+
+###
+### RETRIEVAL STAGE
+###
+
+#retrieve_old_diffs
+def retrieve_old_diffs(station):
+	'''Retrieve diffs representing a complete day if possible, otherwise download the whole archive.
+		If we get the diffs, station-yesterday is patched so that it matches the server's finished list from yesterday.
+		This list is then repeatedly patched throughout the day so it matches the server's current list file.'''
+		
+	# Check if station's list has been downloaded before
+	try:
+		with closing(open(listfile(station+'-yesterday.age'))) as f:
+			localdate = eval(f.read())
+	except IOError, e:
+		if e.errno == 2: # File not found -> always download list
+			log.warn("No time information for local list from yesterday found for "+station)
+			localdate = datetime.date.fromtimestamp(0)
+		else:
+			raise
+			exit(1)
+
+	yesterday = station+'-yesterday'
+
+	if not exists(listfile(yesterday)):
+		log.warn("No local list from yesterday found for "+station)
+		localdate = datetime.date.fromtimestamp(0)
+
+	# Currently, the server keeps the diffs for the last seven days. More would probably not make sense.
+	now = datetime.date.today()
+	max_age = now - datetime.timedelta(days=7)
+	#remotedate = http_last_modified(serverfile(station+'-yesterday'))
+	
+	diffs = []
+	if localdate < max_age:
+		# Download complete list if local one is too old or doesn't exist
+		if not opts['test']:
+			log.info("Downloading complete list from yesterday for "+station)
+			download(serverfile(yesterday+'.xz'),listfile(yesterday+'.tmp.xz'))
+			unxz(listfile(yesterday+'.tmp.xz'))
+		else:
+			log.warn("Skipped download of list "+station)
+	else:
+		# Download individual diffs
+		
+		# Only operate on a copy so we don't corrupt our data
+		copyfile(listfile(yesterday),listfile(yesterday+'.tmp'))
+		localdate += datetime.timedelta(days=1)
+		while localdate < now:
+			datestring = str(localdate.day).zfill(2)+'.'+str(localdate.month).zfill(2)+'.'+str(localdate.year).zfill(4)
+			unxzname = station+'-diff-'+datestring
+			xzname = unxzname+'.xz'
+			if not opts['test']:
+				log.info("Downloading diff "+xzname)
+				download(serverfile(xzname),listfile(xzname))
+				unxz(listfile(xzname))
+				diffs.append(listfile(unxzname))
+			else:
+				log.warn("Skipped download of diff "+xzname)
+			localdate += datetime.timedelta(days=1)
+	return now - datetime.timedelta(days=1), diffs
+#/retrieve_old_diffs
+
+#retrieve_current_diff
+def retrieve_current_diff(station):
+	'''Retrieve the diff representing the change from last change yesterday to now.
+		This should usually be what the user fetches, and only once every two hours,
+		so every client has a few kB of traffic a day.
+		The list itself is always overwritten, it is discardable.'''
+
+	now = datetime.date.today()
+	datestring = str(now.day).zfill(2)+'.'+str(now.month).zfill(2)+'.'+str(now.year).zfill(4)
+
+	# Read list age from station.age
+	try:
+		with closing(open(listfile(station+'.age'))) as f:
+			localdate = eval(f.read())
+	except IOError, e:
+		if e.errno == 2: # File not found -> always download diff
+			log.warn("No local list from today found for "+station)
+			localdate = datetime.datetime.fromtimestamp(0)
+		else:
+			raise
+			exit(1)
+
+	unxzname = station+'-diff-'+datestring
+	xzname = unxzname+'.xz'
+	#TODO: This fails if no diff yet presend
+	remotedate = http_last_modified(serverfile(xzname)) # datetime.datetime
+
+	# Only download if the diff has changed since we last saw it
+	diff = []
+	if localdate < remotedate:
+		if not opts['test']:
+			log.info("Downloading diff "+xzname+" (current)")
+			download(serverfile(xzname),listfile(xzname))
+			unxz(listfile(xzname))
+			diff.append(listfile(unxzname))
+		else:
+			log.warn("Skipped download of diff "+xzname)
+	else:
+		log.info("No new list for "+station)
+
+	return remotedate, diff
+#/retrieve_current_diff
+
+def update_show_list():
+	'''Update the local show list - if a user isn't scubscribed to all stations, we can't generate it'''
+	try:
+		with closing(open(listfile('shows.age'))) as f:
+			localdate = eval(f.read())
+	except IOError, e:
+		if e.errno == 2: # File not found -> always download
+			log.warn("No local show list found.")
+			localdate = datetime.datetime.fromtimestamp(0)
+		else:
+			raise
+			exit(1)
+
+	remotedate = http_last_modified(serverfile('shows.xz'))
+
+	if localdate < remotedate:
+		if not opts['test']:
+			log.info("Downloading show list.")
+			download(serverfile('shows.xz'),listfile('shows.xz'))
+			unxz(listfile('shows.xz'))
+			with closing(open(listfile('shows.age'),'w')) as f:
+				f.write(repr(remotedate))
+		else:
+			log.warn("Skipped download of new show list.")
+	else:
+		log.info("No new show list available.")
+
+###
+### MODIFICATION STAGE
+###
+
+def apply_diffs(station, diffs):
+	'''Apply downloaded <diffs> to <station> so that it is up-to-date with the current server status'''
+	for diff in diffs:
+		log.info("Applying diff "+diff)
+		# TODO: Find a way to do this inside python for cross-platform compatibility
+		# TODO: Understand unified diffs
+		if system('patch '+listfile(station)+' < '+diff+' > /dev/null'):
+			log.error("Something went wrong when patching "+station+" with "+diff.split('/')[-1]+"!")
+			exit(1)
+		remove(diff)
+
+def check_md5_integrity_for_tmp_list(station):
+	'''md5-hash the list, compare to the md5 stored on the server, return True/False for correct / incorrect'''
+	md5obj = md5()
+
+	# Iterate through the file so we use 8kB of memory at most
+	with open(listfile(station)+'.tmp','rb') as f:
+		for chunk in iter(lambda: f.read(8192), b''):
+			md5obj.update(chunk)
+
+	with closing(urllib.urlopen(serverfile(station+'.md5'))) as f:
+		if f.read() != md5obj.hexdigest():
+			log.error("MD5 sums of local file and server file for "+station+" do not match.")
+			return False
+		else:
+			log.info("Integrity checked successfully for "+station)
+			return True
+
+def update_time(station,date):
+	'''Write the date to station.age so we know when it was last updated successfully'''
+	with closing(open(listfile(station+'.age'),'w')) as f:
+		f.write(repr(date))
+
+###
+### PARSING STAGE
+###
+
+def parse_subscriptions():
+	'''Parse the subscriptions CSV, pretty straightforward'''
+	sep = SEPCHAR
+	
+	with closing(open(conffile('subscribe'))) as f:
+		subs_raw = f.read().splitlines()
+	subscriptions = {}
+
+	for sub in subs_raw:
+		if sub == '':
+			continue
+		sub = sub.split(sep)
+		if len(sub) != 3:
+			log.error("Malformed subscription: "+sep.join(sub))
+			exit(1)
+		if not subscriptions.has_key(sub[0]):
+			subscriptions[sub[0]] = {}
+		subscriptions[sub[0]][sub[1]] = sub[2]
+	log.info("Successfully read subscriptions.")
+	
+	return subscriptions
+
+def parse_blacklist():
+	'''Parse the blacklist file, one entry per list element'''
+	with closing(open(conffile('blacklist'))) as f:
+		blacklist = f.read().splitlines()
+	return blacklist
+
+def parse_seen():
+	'''Parse the hash catalogue of seen files, one entry per list element'''
+	# TODO: How to identify reruns?
+	with closing(open(conffile('seen'))) as f:
+		seen = f.read().splitlines()
+	return seen
+
+#parse_filmlist
+def parse_filmlist(subscriptions,seen,blacklist):
+	'''Parse the current lists containing the shows for each station
+		Filter them by length, subscription, seen status and blacklist
+		Only return those who will be downloaded'''
+
+	# TODO: Increase performance
+
+	with closing(open(conffile('stations'))) as f:
+		stations = f.read().splitlines()
+
+	want = []
+	stationlist = []
+	durations = {}
+	headers = ['Thema','Titel','Datum','Zeit','Dauer','Url']
+	for station in stations:
+		with closing(open(listfile(station))) as f:
+			in_wanted_block = False
+			wantsum = 0
+			totalsum = 0
+			shortsum = 0
+			blacksum = 0
+			for line in f:
+
+				line = line.strip().split(SEPCHAR)
+
+				if not subscriptions[station].has_key(line[0]):
+					continue
+
+				try:
+					broadcast = dict(zip(headers,line))
+				except:
+					raise
+					exit(1)
+
+				# Filter by blacklist
+				try:
+					for blacked in blacklist:
+						if blacked.lower() in broadcast['Titel'].lower():
+							blacksum += 1
+							raise StopIteration
+				except StopIteration:
+					continue
+
+				# Find out if we're subscribed to this show
+				totalsum += 1
+				# Find out if we've seen this broadcast
+				check = broadcast_hash(broadcast)
+				if check not in seen:
+					# Find out if it's too short
+					wantduration=int(subscriptions[station][broadcast['Thema']])*60
+					try:
+						d=strptime(broadcast['Dauer'],'%H:%M:%S')
+						showduration=int(datetime.timedelta(hours=d.tm_hour,minutes=d.tm_min,seconds=d.tm_sec).total_seconds())
+					except ValueError:
+						showduration = wantduration
+					if showduration < wantduration:
+						shortsum += 1
+					else:
+						want.append(broadcast)
+						wantsum +=1
+		log.info("Successfully parsed list "+station+", found "+str(totalsum)+" broadcasts of subscribed shows. "+
+			str(wantsum)+" will be downloaded, "+str(shortsum)+" are too short, "+str(blacksum)+" are blacklisted.")
+
+	return want
+#/parse_filmlist
+
+def parse_show_list(subscriptions):
+	'''Parse the local show list and return a list of stations and subscribed and unsubscribed shows for later use'''
+	stations = []
+	subscribed = []
+	unsubscribed = []
+	headers = ['Station','Thema','Duration','Count']
+	with closing(open(listfile('shows'))) as f:
+		for line in f:
+			line = dict(zip(headers,line.split(SEPCHAR)))			
+			if not line['Station'] in stations:
+				stations.append(line['Station'])
+			entry = (line['Thema'],{'count':int(line['Count']),'dur':int(line['Duration']),'where':line['Station']})
+			if subscriptions.has_key(line['Station']) and subscriptions[line['Station']].has_key(line['Thema']):
+				subscribed.append(entry)
+			else:
+				unsubscribed.append(entry)
+	return ['All'] + sorted(stations), sorted(subscribed, key=lambda s: s[0].lower()), sorted(unsubscribed, key=lambda s: s[0].lower())
+
+###
+### DOWNLOAD STAGE
+###
+
+#download_mediathek
+def download_mediathek(download_list,subscriptions,seen):
+	'''Finally, download all the shows in download_list from Mediathek'''
+	for broadcast in download_list:
+		if isinstance(opts['mark_seen'],basestring) and not broadcast['Thema'] == opts['mark_seen']:
+			break
+		log.info("Found new show: "+broadcast['Thema']+" - "+broadcast['Titel'])
+		
+		# Download and notification will only happen if we're not running a test
+		if not opts['mark_seen'] and not opts['test']:
+			notification("Downloading from Mediathek','New show: "+broadcast['Titel'].decode('UTF-8').encode('UTF-8'),opts['notifyicon'])
+			name = (broadcast['Datum'][0:6]+' '+broadcast['Zeit'][0:5]+' - '+broadcast['Thema']+' - '+broadcast['Titel']+'.mp4').decode('UTF-8').encode('UTF-8')
+			path = os.path.expanduser(os.path.join(opts['targetdir'],name.replace('/','.')))
+			log.info("Downloading to "+path+"...")
+			mark_show = download(broadcast['Url'],path,quiet=False,show=True) # True if download wasn't canceled
+			
+		# Marking show as seen will only happen if download was complete or user marked it seen with -m
+		if ( not opts['test'] ) and ( opts['mark_seen'] or mark_show ):
+			check = broadcast_hash(broadcast)
+			seen.append(check)
+			with closing(open(conffile('seen'),'w')) as f:
+				f.write('\n'.join(seen))
+#/download_mediathek
+
+###################################################################################################################################################################
+
+##############################
+### MAIN
+##############################
+
+def main():
+	# For optional timing output
+	TIMING = {}
+	TIMING['start'] = time()
+
+	# Config stage
+	check_config()		# Check existence of config files
+	parse_arguments()	# Parse arguments and config file
+	apply_options()		# Set various variables according to options
+
+	# Retrieval stage
+	if opts['show_update'] or opts['update']:
+		update_show_list()
+	
+	if opts['update']:
+		with open(conffile('stations')) as f:
+			for station in f.read().splitlines():
+				if station == '':
+					continue
+			
+				# First, download all the diffs we need
+				remotedate_yesterday, old_diffs = retrieve_old_diffs(station)
+				remotedate, current_diff = retrieve_current_diff(station)
+				
+				if old_diffs and not current_diff:
+					log.error("Got diffs for previous days, but not today!")
+					exit(1)
+				if not opts['test']:
+					# Modification stage
+					
+					# TODO: Check the logic here, too much room for bugs
+					
+					# First bring the -yesterday file up to speed if necessary
+					apply_diffs(station+'-yesterday.tmp',old_diffs)
+					if check_md5_integrity_for_tmp_list(station+'-yesterday'):
+						# Only actually do anything if the hash is correct to prevent corruption
+						rename(listfile(station+'-yesterday.tmp'),listfile(station+'-yesterday'))
+						update_time(station+'-yesterday',remotedate_yesterday)
+					else:
+						# TODO: Re-download whole file (fix diff bug first!)
+						exit(1)
+					
+					# Then patch the -yesterday file with the current diff to get the most recent list state from today
+					if current_diff:
+						copyfile(listfile(station+'-yesterday'),listfile(station+'.tmp'))
+						apply_diffs(station+'.tmp',current_diff)
+						if check_md5_integrity_for_tmp_list(station):
+							# Only actually do anything if the hash is correct to prevent corruption
+							rename(listfile(station+'.tmp'),listfile(station))
+							update_time(station,remotedate)
+						else:
+							# No need to re-download here, something went seriously wrong if this happens
+							exit(1)
+					else:
+						copyfile(station+'-yesterday',station)
+
+	TIMING['stage_1'] = time() - TIMING['start']
+
+	# Parsing stage
+	subscriptions = parse_subscriptions()
+	blacklist = parse_blacklist()
+	seen = parse_seen()
+	downloads = parse_filmlist(subscriptions,seen,blacklist)
+	stations, subscribed, unsubscribed = parse_show_list(subscriptions)
+	
+	TIMING['stage_2'] = time() - TIMING['start']
+	
+	# Download stage
+	if opts['download'] or opts['mark_seen']:
+		download_mediathek(downloads,subscriptions,seen)
+
+	TIMING['stage_3'] = time() - TIMING['start']
+
+	# Optional timing output
+	if opts['timing']:	
+		log.info("Setup stage total:\t\tt+"+str(TIMING['stage_1'])+" "+str(TIMING['stage_1']))
+		log.info("Parse stage total:\t\tt+"+str(TIMING['stage_2'])+" "+str(TIMING['stage_2']-TIMING['stage_1']))
+		log.info("Download stage total:\t\tt+"+str(TIMING['stage_3'])+" "+str(TIMING['stage_3']-TIMING['stage_2']))
+		log.info("GRAND TOTAL:\t\t\t"+str(time()-TIMING['start']))
+
+	# Finally, open GUI if user wants it and GTK is installed
+	if UI and opts['gui']:
+		win = DialogWindow(subscribed, unsubscribed, stations)
+		win.connect('delete-event', Gtk.main_quit)
+		win.connect('destroy', Gtk.main_quit)
+		signal.signal(signal.SIGINT, signal.SIG_DFL)
+		Gtk.main()
+
+if __name__ == '__main__':
+	main()
