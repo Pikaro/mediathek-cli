@@ -1,7 +1,7 @@
 mediathek-cli
 ======
 
-CLI mod of the popular Mediathek3 client - ALPHA 0.09a
+CLI mod of the popular Mediathek3 client - ALPHA 0.2.0a
 
 mediathek-cli is capable of subscribing to videos from Mediathek and Arte+7 from the command line, without making a GUI necessary for regular updates.
 
@@ -42,6 +42,7 @@ HISTORY
 - made ask dialog graphical
 - implemented patch natively - platform-independent, yay!
 - minor visual changes, bugfixes, additions
+
 0.1.0a
 - First upload to github
 
