@@ -57,12 +57,12 @@ TODO
 - Change minimum duration from GUI
 - State file location in Windows and OSX?
 - Make whole program usable from GUI?
-- When no new day list is downloaded by server yet, station-yesterday is the file from the day _before_ yesterday, not from yesterday. Screws up md5summing, of course, plus thorws local state back.
 - Fix horrible update logic
 
-=====
+======
 
 BUGS
 
 - Strange bug when counting filtered ListView lines... hacked around it, still
-- 
+- When no new day list is downloaded by server yet, station-yesterday is the file from the day _before_ yesterday, not from yesterday. Screws up md5summing, of course, plus thorws local state back.
+
